@@ -1,0 +1,89 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: example-app-deployment
+spec:
+  selector:
+    matchLabels:
+      app: example-app
+  replicas: 3 # Количество реплик кратно количеству зон для равномерного распределения подов
+  template:
+    metadata:
+      labels:
+        app: example-app
+    spec:
+      containers:
+        - name: example-app
+          image: nginx
+          resources:
+            limits:
+              memory: "160Mi" 
+              cpu: "500m" 
+              # Запускаем с заведомо большим количеством ресурсов на случай необходимости, далее это количество
+              # возьмет под контроль VPA и снизит его, если оно не требуется 
+          ports:
+            - containerPort: 80
+          readinessProbe: # Проверяем готово ли приложение в контейнере принимать запросы
+            httpGet:
+              port: 80
+              path: /status
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              port: 80
+              path: /status
+            periodSeconds: 10
+            initialDelaySeconds: 15 # Поскольку в среднем требуется 5-10 секунд для инициализации, даем максимум 15 секунд
+  # Равномерное распределение подов по зонам 
+  topologySpreadConstraints:
+    - maxSkew: 1
+      topologyKey: zone
+      whenUnsatisfiable: DoNotShedule
+      labelSelector:
+        matchLabels:
+          app: example-app
+---
+# Поскольку кластер мультизональный и используется topologySpreadConstraints, контролировать количество подов в отдельной зоне 
+# является затруднительным (альтернативным решением является запуск 3 deployment соответсвенно зонам, но в таком случае 
+# усложняется задача по поддержке), поэтому в данной ситуации применяем VPA для расширения ресурсов отдельного пода
+apiVersion: autoscaling.k8s.io/v1
+kind: VerticalPodAutoscaler
+metadata:
+  name: example-app-vpa
+spec: 
+  targetRef: 
+    apiVersion: apps/v1
+    kind: Deployment
+    name: example-app-deployment
+  updatePolicy:
+    updateMode: Auto
+  resourcePolicy:
+    containerPolicies:
+      - containerName: example-app
+        maxAllowed:
+          cpu: "500m"
+          memory: "160Mi"
+        minAllowed: 
+          cpu: "100m"
+          memory: "160Mi"
+---
+# Поскольку известно, что пиковые нагрузки приложение испытывает днем, необходим контроль количества реплик в 
+# соответсвии со временем
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata: 
+  name: cron-scaler
+spec: 
+  scaleTargetRef:
+    name: example-app-deployment
+  minReplicaCount: 3
+  triggers:
+    - type: cron
+      metadata:
+        timezone: Europe/Moskow
+        start: 0 8 * * *
+        end: 59 23 * * *
+        desiredReplicas: "12" # 4 пода справляющихся с нагрузкой * 3 зоны кластера
+        # Также возможна дополнительная конфигурация контроля количества реплик в зависимости от исследования времени нагрузки,
+        # например снижение количества подов до 9 или 6 после 18.00
+    
